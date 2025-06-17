@@ -1,6 +1,13 @@
 #!/bin/bash
 
-set -eo pipefail
+set -xeo pipefail
+
+set
+
+if [[ -f "$GITHUB_EVENT_PATH" ]]; then
+  echo "Event JSON payload:"
+  cat "$GITHUB_EVENT_PATH"
+fi
 
 # config
 default_semvar_bump=${DEFAULT_BUMP:-minor}
@@ -53,15 +60,25 @@ echo -e "\tFORCE_WITHOUT_CHANGES: ${force_without_changes}"
 echo -e "\tFORCE_WITHOUT_CHANGES_PRE: ${force_without_changes_pre}"
 echo -e "\tTAG_MESSAGE: ${tag_message}"
 
-# verbose, show everything
-if $verbose
-then
-    set -x
-fi
-
 setOutput() {
     echo "${1}=${2}" >> "${GITHUB_OUTPUT}"
 }
+
+# 1. Latest tag by commit (descending)
+# latest_commit_tags=$(git tag --sort=-committerdate --merged "${GITHUB_REF_NAME}" | head -n 1)
+
+# 2. Latest tag by tagged timestamp (descending)
+# latest_taggerdate_tags=$(git for-each-ref --sort=-taggerdate --format '%(refname:short)' refs/tags --merged "${GITHUB_REF_NAME}"  | head -n 1)
+
+# 3 & 4. Latest tags by semver (including and excluding pre-releases)
+# export $(node sort-tags.js) # This will set the semver-based env variables
+
+# Output environment variables for debugging
+# echo "latest_commit_tags=$latest_commit_tags"
+# echo "latest_taggerdate_tags=$latest_taggerdate_tags"
+# echo "latest_tag_by_semver_including_prereleases=$latest_tag_by_semver_including_prereleases"
+# echo "latest_tag_by_semver_excluding_prereleases=$latest_tag_by_semver_excluding_prereleases"
+
 
 current_branch=$(git rev-parse --abbrev-ref HEAD)
 
@@ -202,7 +219,7 @@ then
         exit 0
     fi
     # already a pre-release available, bump it
-    if [[ "$pre_tag" =~ $new ]] && [[ "$pre_tag" =~ $suffix ]]
+    if [[ ! "$pre_tag" =~ $new ]] && [[ "$pre_tag" =~ $suffix ]]
     then
         if $with_v
         then
@@ -241,7 +258,7 @@ setOutput "part" "$part"
 setOutput "tag" "$new" # this needs to go in v2 is breaking change
 setOutput "old_tag" "$tag"
 
-# dry run exit without real changes
+# dry run exit without real changes
 if $dryrun
 then
     exit 0
@@ -254,11 +271,42 @@ then
     git tag -a "$new" -m "$tag_message" || exit 1
 else
     echo "EVENT: creating local tag $new"
-    # git tag -f "$new" || exit 1
-    git tag -a "$new" -m "$new" || exit 1
+    git tag -f "$new" || exit 1
 fi
 
 echo "EVENT: pushing tag $new to origin"
 
-# use git cli to push
-git push -f origin "$new" || exit 1
+if $git_api_tagging
+then
+    # use git api to push
+    dt=$(date '+%Y-%m-%dT%H:%M:%SZ')
+    full_name=$GITHUB_REPOSITORY
+    git_refs_url=$(jq .repository.git_refs_url "$GITHUB_EVENT_PATH" | tr -d '"' | sed 's/{\/sha}//g')
+
+    echo "$dt: **pushing tag $new to repo $full_name"
+
+    git_refs_response=$(
+    curl -s -X POST "$git_refs_url" \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -d @- << EOF
+{
+    "ref": "refs/tags/$new",
+    "sha": "$commit"
+}
+EOF
+)
+
+    git_ref_posted=$( echo "${git_refs_response}" | jq .ref | tr -d '"' )
+
+    echo "::debug::${git_refs_response}"
+    if [ "${git_ref_posted}" = "refs/tags/${new}" ]
+    then
+        exit 0
+    else
+        echo "::error::Tag was not created properly."
+        exit 1
+    fi
+else
+    # use git cli to push
+    git push -f origin "$new" || exit 1
+fi
